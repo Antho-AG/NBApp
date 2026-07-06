@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NBA Profile Analyzer</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/kiviat.css">
+<link rel="stylesheet" href="css/responsive.css">
+</head>
+<body>
+
+<header class="app-header">
+  <h1>🏀 NBA PROFILE ANALYZER</h1>
+  <p class="subtitle">Analysez et comparez les profils NBA en centiles</p>
+</header>
+
+<main class="app-main">
+
+  <!-- ZONE DE RECHERCHE JOUEURS -->
+  <section class="search-zone" id="searchZone">
+    <div class="player-slot" data-slot="0">
+      <label class="player-slot-label">Joueur 1</label>
+      <div class="search-input-wrap">
+        <input type="text" class="player-search-input" placeholder="🔍 Rechercher un joueur..." data-slot="0" autocomplete="off">
+        <button class="btn-clear-player" data-slot="0" hidden>×</button>
+        <ul class="autocomplete-list" data-slot="0" hidden></ul>
+      </div>
+    </div>
+
+    <div class="player-slot player-slot-optional" data-slot="1" hidden>
+      <label class="player-slot-label">Joueur 2</label>
+      <div class="search-input-wrap">
+        <input type="text" class="player-search-input" placeholder="🔍 Rechercher un joueur..." data-slot="1" autocomplete="off">
+        <button class="btn-clear-player" data-slot="1" hidden>×</button>
+        <ul class="autocomplete-list" data-slot="1" hidden></ul>
+      </div>
+    </div>
+
+    <div class="player-slot player-slot-optional" data-slot="2" hidden>
+      <label class="player-slot-label">Joueur 3</label>
+      <div class="search-input-wrap">
+        <input type="text" class="player-search-input" placeholder="🔍 Rechercher un joueur..." data-slot="2" autocomplete="off">
+        <button class="btn-clear-player" data-slot="2" hidden>×</button>
+        <ul class="autocomplete-list" data-slot="2" hidden></ul>
+      </div>
+    </div>
+
+    <button class="btn-add-player" id="btnAddPlayer">+ Ajouter un joueur pour comparer</button>
+
+    <div class="player-legend" id="playerLegend" hidden></div>
+  </section>
+
+  <!-- CONTROLES GLOBAUX -->
+  <section class="controls-panel" id="controlsPanel">
+    <div class="control-group">
+      <label for="seasonSelect">Saison</label>
+      <select id="seasonSelect"></select>
+    </div>
+
+    <div class="control-group">
+      <span class="control-label">Comparer à</span>
+      <div class="toggle-group">
+        <label><input type="radio" name="compareMode" value="global" checked> NBA Global</label>
+        <label><input type="radio" name="compareMode" value="position"> Par poste</label>
+      </div>
+    </div>
+
+    <div class="control-group control-group-slider">
+      <label for="minMinutesSlider">Minutage minimum : <span id="minMinutesValue">15</span> min/match</label>
+      <input type="range" id="minMinutesSlider" min="5" max="35" step="5" value="15">
+      <div class="slider-range-labels"><span>5 min</span><span>35 min</span></div>
+    </div>
+
+    <button class="btn-refresh" id="btnRefresh">🔄 Actualiser les centiles</button>
+  </section>
+
+  <div class="warning-banner" id="positionWarning" hidden></div>
+
+  <!-- FICHES JOUEURS -->
+  <section class="player-cards" id="playerCards"></section>
+
+  <!-- ETAT APPLICATION -->
+  <section class="app-state" id="appState">
+    <div class="state-empty" id="stateEmpty">
+      <p>🔍 Recherchez un joueur NBA pour commencer</p>
+      <div class="state-examples">
+        <button class="btn-example" data-example="jamesle01|LeBron James">LeBron James</button>
+        <button class="btn-example" data-example="curryst01|Stephen Curry">Stephen Curry</button>
+        <button class="btn-example" data-example="wembavi01|Victor Wembanyama">Victor Wembanyama</button>
+      </div>
+    </div>
+    <div class="state-loading" id="stateLoading" hidden>
+      <div class="spinner"></div>
+      <p id="loadingMessage">Collecte des données BBRef...</p>
+    </div>
+    <div class="state-error" id="stateError" hidden>
+      <p id="errorMessage"></p>
+    </div>
+  </section>
+
+  <!-- GRID DES 4 KIVIAT -->
+  <section class="kiviat-grid" id="kiviatGrid" hidden>
+    <div class="kiviat-card profile-general" id="cardGeneral">
+      <div class="kiviat-header">
+        <h2>🏆 Général</h2>
+        <span class="axis-count" id="axisCountGeneral"></span>
+      </div>
+      <div class="kiviat-canvas-wrap"><canvas id="chartGeneral"></canvas></div>
+    </div>
+    <div class="kiviat-card profile-physique" id="cardPhysique">
+      <div class="kiviat-header">
+        <h2>💪 Physique</h2>
+        <span class="axis-count" id="axisCountPhysique"></span>
+      </div>
+      <div class="kiviat-canvas-wrap"><canvas id="chartPhysique"></canvas></div>
+    </div>
+    <div class="kiviat-card profile-offensif" id="cardOffensif">
+      <div class="kiviat-header">
+        <h2>⚔️ Offensif</h2>
+        <span class="axis-count" id="axisCountOffensif"></span>
+      </div>
+      <div class="kiviat-canvas-wrap"><canvas id="chartOffensif"></canvas></div>
+    </div>
+    <div class="kiviat-card profile-defensif" id="cardDefensif">
+      <div class="kiviat-header">
+        <h2>🛡️ Défensif</h2>
+        <span class="axis-count" id="axisCountDefensif"></span>
+      </div>
+      <div class="kiviat-canvas-wrap"><canvas id="chartDefensif"></canvas></div>
+    </div>
+  </section>
+
+  <!-- TABLEAU STATS DETAILLEES -->
+  <section class="stats-table-section" id="statsTableSection" hidden>
+    <h2>Statistiques détaillées</h2>
+    <div class="stats-table-wrap">
+      <table class="stats-table" id="statsTable">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<footer class="app-footer">
+  <p>Données : Basketball-Reference.com — usage éducatif non affilié. Filtre minutage &amp; saison appliqués aux centiles.</p>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="js/stats.js"></script>
+<script src="js/scraper.js"></script>
+<script src="js/kiviat.js"></script>
+<script src="js/compare.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
