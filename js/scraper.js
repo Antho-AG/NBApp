@@ -8,22 +8,33 @@
  * unwraps those comments before parsing.
  */
 
-const CORS_PROXY = 'https://corsproxy.io/?url=';
 const BBREF_BASE = 'https://www.basketball-reference.com';
+
+// Public CORS proxies, tried in order. Free proxies get rate-limited or blocked by
+// target sites unpredictably, so a single one (corsproxy.io) is not reliable enough
+// on its own — fall through the list until one responds successfully.
+const CORS_PROXIES = [
+  (url) => 'https://corsproxy.io/?url=' + encodeURIComponent(url),
+  (url) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  (url) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url)
+];
 
 class ProxyError extends Error {}
 class PlayerNotFoundError extends Error {}
 
 async function fetchViaProxy(url) {
-  let res;
-  try {
-    res = await fetch(CORS_PROXY + encodeURIComponent(url));
-  } catch (e) {
-    throw new ProxyError('Service temporairement indisponible — proxy CORS hors ligne');
+  for (const buildProxyUrl of CORS_PROXIES) {
+    let res;
+    try {
+      res = await fetch(buildProxyUrl(url));
+    } catch (e) {
+      continue; // network error / CORS failure on this proxy, try the next one
+    }
+    if (res.status === 404) throw new PlayerNotFoundError('Joueur non trouvé sur Basketball-Reference');
+    if (!res.ok) continue; // this proxy rejected/rate-limited us, try the next one
+    return res.text();
   }
-  if (res.status === 404) throw new PlayerNotFoundError('Joueur non trouvé sur Basketball-Reference');
-  if (!res.ok) throw new ProxyError('Basketball-Reference inaccessible — réessayez dans quelques instants');
-  return res.text();
+  throw new ProxyError('Basketball-Reference inaccessible — tous les proxys CORS ont échoué, réessayez dans quelques instants');
 }
 
 function parseHtml(html) {
