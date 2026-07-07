@@ -375,7 +375,6 @@ if (typeof module !== 'undefined') {
   module.exports = {
     fetchPlayerProfile, fetchLeagueDataset, searchPlayers, listSeasons, seasonLabel, currentSeasonEndYear,
     ProxyError, PlayerNotFoundError
-  };
-}
+
   };
 }
