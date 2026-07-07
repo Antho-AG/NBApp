@@ -161,12 +161,17 @@ function parseBio(doc, html, seasonLabelStr) {
     bio.weightKg = parseInt(hw[2], 10);
   }
 
-  const posMatch = text.match(/Position:\s*([A-Za-z\-\/ ]+?)(?:▪|▪|\n|Shoot)/);
+  // Veteran/multi-position players (e.g. "Position: Small Forward, Power Forward,
+  // Point Guard, Center, and Shooting Guard") list every position they've ever played,
+  // comma-separated, before the next "▪" bullet — take the first (primary) one rather
+  // than matching a fixed set of single-word patterns, which fails on comma lists.
+  const posMatch = text.match(/Position:\s*([^▪\n]+?)\s*(?:▪|\n|$)/);
   if (posMatch) {
     const raw = posMatch[1].trim();
+    const firstPos = raw.split(',')[0].replace(/^and\s+/i, '').trim();
     const abbrevMap = { 'Point Guard': 'PG', 'Shooting Guard': 'SG', 'Small Forward': 'SF', 'Power Forward': 'PF', 'Center': 'C' };
-    const firstWord = Object.keys(abbrevMap).find(k => raw.includes(k));
-    bio.position = firstWord ? abbrevMap[firstWord] : raw.split(/[\s\-\/]/)[0].slice(0, 2).toUpperCase();
+    const matchKey = Object.keys(abbrevMap).find(k => firstPos === k || firstPos.startsWith(k));
+    bio.position = matchKey ? abbrevMap[matchKey] : firstPos.split(/[\s\-\/]/)[0].slice(0, 2).toUpperCase();
   }
 
   // Age as of the selected season: derive from birth date + season start year.
@@ -190,18 +195,30 @@ function parseBio(doc, html, seasonLabelStr) {
   return bio;
 }
 
+// BBRef renamed several data-stat keys in its 2024/2025 redesign:
+// "season" -> "year_id", and the combined-team row for a traded player used to be
+// marked team_id="TOT", now it's team_name_abbr="2TM"/"3TM"/"4TM" (or still "TOT"
+// on some pages). rowSeason()/isCombinedRow() read both old and new keys so the
+// scraper works regardless of which version BBRef serves.
+function rowSeason(r) {
+  return r.year_id || r.season;
+}
+function isCombinedRow(r) {
+  const team = r.team_name_abbr || r.team_id || '';
+  return team === 'TOT' || /^\dTM$/.test(team);
+}
 function findSeasonRow(rows, seasonStr) {
-  const matches = rows.filter(r => r.season === seasonStr);
+  const matches = rows.filter(r => rowSeason(r) === seasonStr);
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];
-  return matches.find(r => r.team_id === 'TOT') || matches[matches.length - 1];
+  return matches.find(isCombinedRow) || matches[matches.length - 1];
 }
 
 function extractPerGame(rows, seasonStr) {
   const row = findSeasonRow(rows, seasonStr);
   if (!row) return null;
   return {
-    PTS: num(row.pts_per_g), G: num(row.g), MP: num(row.mp_per_g),
+    PTS: num(row.pts_per_g), G: num(row.games ?? row.g), MP: num(row.mp_per_g),
     FG_PCT: num(row.fg_pct) != null ? num(row.fg_pct) * 100 : null,
     THREE_PCT: num(row.fg3_pct) != null ? num(row.fg3_pct) * 100 : null,
     FT_PCT: num(row.ft_pct) != null ? num(row.ft_pct) * 100 : null,
@@ -228,15 +245,19 @@ function extractAdvanced(rows, seasonStr) {
 function extractShooting(rows, seasonStr) {
   const row = findSeasonRow(rows, seasonStr);
   if (!row) return { DUNK_PCT: null, TWO_PCT: null, THREE_PCT_SHARE: null, CS_PCT: null, PU_PCT: null, AST_RATIO: null };
-  const pctAst2 = num(row.fg_pct_ast_2p);
-  const pctAst3 = num(row.fg_pct_ast_3p);
+  // BBRef renamed these columns too: fg_pct_ast_2p/3p -> pct_ast_fg2/fg3,
+  // pct_fga_02p/03p -> pct_fga_fg2a/fg3a. Read both so older/newer markup both work.
+  const pctAst2 = num(row.pct_ast_fg2 ?? row.fg_pct_ast_2p);
+  const pctAst3 = num(row.pct_ast_fg3 ?? row.fg_pct_ast_3p);
   const astRatio = (pctAst2 != null || pctAst3 != null)
     ? ((pctAst2 || 0) + (pctAst3 || 0)) / ((pctAst2 != null ? 1 : 0) + (pctAst3 != null ? 1 : 0)) * 100
     : null;
+  const twoShare = num(row.pct_fga_fg2a ?? row.pct_fga_02p);
+  const threeShare = num(row.pct_fga_fg3a ?? row.pct_fga_03p);
   return {
     DUNK_PCT: num(row.pct_fga_dunk) != null ? num(row.pct_fga_dunk) * 100 : null,
-    TWO_PCT: num(row.pct_fga_02p) != null ? num(row.pct_fga_02p) * 100 : null,
-    THREE_PCT_SHARE: num(row.pct_fga_03p) != null ? num(row.pct_fga_03p) * 100 : null,
+    TWO_PCT: twoShare != null ? twoShare * 100 : null,
+    THREE_PCT_SHARE: threeShare != null ? threeShare * 100 : null,
     // NBA.com/Synergy tracking stats (Catch&Shoot%, Pull-Up%) are not published on
     // Basketball-Reference at all — always N/D, never approximated.
     CS_PCT: null,
@@ -253,7 +274,6 @@ async function fetchPlayerProfile(slug, seasonStr) {
 
   const initial = slug[0];
   const playerUrl = `${BBREF_BASE}/players/${initial}/${slug}.html`;
-  const shootingUrl = `${BBREF_BASE}/players/${initial}/${slug}/shooting/${seasonStr.split('-')[0]}`;
 
   const html = await fetchViaProxy(playerUrl);
   const doc = parseHtml(html);
@@ -268,11 +288,13 @@ async function fetchPlayerProfile(slug, seasonStr) {
 
   const bio = parseBio(doc, html, seasonStr);
 
+  // The season-by-season shot-zone breakdown (dunk%, 2P/3P share, % assisted) lives in
+  // a "shooting" table on the player's MAIN page, not on the separate /shooting/<year>
+  // URL (that page is a game-splits breakdown — by month, quarter, etc. — for a single
+  // season and doesn't carry these columns at all).
   let shooting = { DUNK_PCT: null, TWO_PCT: null, THREE_PCT_SHARE: null, CS_PCT: null, PU_PCT: null, AST_RATIO: null };
   try {
-    const shootingHtml = await fetchViaProxy(shootingUrl);
-    const shootingDoc = parseHtml(shootingHtml);
-    const shootingRows = parseTableRows(getTableAny(shootingDoc, shootingHtml, ['shooting_stats', 'shooting']));
+    const shootingRows = parseTableRows(getTableAny(doc, html, ['shooting_stats', 'shooting']));
     shooting = extractShooting(shootingRows, seasonStr);
   } catch (e) {
     // Shooting detail is a nice-to-have; missing it degrades to N/D axes, not a hard failure.
@@ -324,12 +346,12 @@ async function fetchLeagueDataset(seasonStr, minMinutes) {
     perGameRows.forEach(r => {
       if (!r._slug) return;
       const existing = bySlug[r._slug];
-      if (!existing || r.team_id === 'TOT') bySlug[r._slug] = { ...existing, pg: r };
+      if (!existing || isCombinedRow(r)) bySlug[r._slug] = { ...existing, pg: r };
     });
     advancedRows.forEach(r => {
       if (!r._slug) return;
       const existing = bySlug[r._slug] || {};
-      if (!existing.adv || r.team_id === 'TOT') bySlug[r._slug] = { ...existing, adv: r };
+      if (!existing.adv || isCombinedRow(r)) bySlug[r._slug] = { ...existing, adv: r };
     });
 
     raw = Object.entries(bySlug)
@@ -350,7 +372,7 @@ async function fetchLeagueDataset(seasonStr, minMinutes) {
 // so these flat extractors read fields directly instead of matching a season string.
 function extractPerGameFlat(row) {
   return {
-    PTS: num(row.pts_per_g), G: num(row.g), MP: num(row.mp_per_g),
+    PTS: num(row.pts_per_g), G: num(row.games ?? row.g), MP: num(row.mp_per_g),
     FG_PCT: num(row.fg_pct) != null ? num(row.fg_pct) * 100 : null,
     THREE_PCT: num(row.fg3_pct) != null ? num(row.fg3_pct) * 100 : null,
     FT_PCT: num(row.ft_pct) != null ? num(row.ft_pct) * 100 : null,
@@ -375,6 +397,5 @@ if (typeof module !== 'undefined') {
   module.exports = {
     fetchPlayerProfile, fetchLeagueDataset, searchPlayers, listSeasons, seasonLabel, currentSeasonEndYear,
     ProxyError, PlayerNotFoundError
-
   };
 }
