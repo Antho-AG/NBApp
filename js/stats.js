@@ -113,7 +113,7 @@ const PROFILES = {
       { key: 'AST_PCT', label: 'AST%', path: 'advanced.AST_PCT', unit: '%' },
       { key: 'AST_TO', label: 'AST/TO', path: null, unit: '' },
       { key: 'TOV_PCT', label: 'TOV%', path: 'advanced.TOV_PCT', unit: '%', inversed: true },
-      { key: 'FTr', label: 'FTr', path: 'shooting.FT_RATE', unit: '' },
+      { key: 'FTr', label: 'FTr', path: 'advanced.FT_RATE', unit: '' },
       { key: 'DUNK_PCT', label: 'Dunk%', path: 'shooting.DUNK_PCT', unit: '%' },
       { key: 'TWO_PCT', label: '2P%(tirs)', path: 'shooting.TWO_PCT', unit: '%' },
       { key: 'THREE_PCT_SHARE', label: '3P%(tirs)', path: 'shooting.THREE_PCT_SHARE', unit: '%' },
