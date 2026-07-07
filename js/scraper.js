@@ -60,6 +60,20 @@ function getTable(doc, rawHtml, tableId) {
   return null;
 }
 
+/**
+ * BBRef has renamed several table ids over time (e.g. "per_game" -> "per_game_stats"
+ * on player pages, while league pages already used "_stats"-suffixed ids). Try each
+ * candidate id in order and return the first table found, so the scraper survives
+ * either naming scheme.
+ */
+function getTableAny(doc, rawHtml, tableIds) {
+  for (const id of tableIds) {
+    const table = getTable(doc, rawHtml, id);
+    if (table) return table;
+  }
+  return null;
+}
+
 /** Parse a BBRef table's <tbody> rows into objects keyed by data-stat, skipping repeated header rows. */
 function parseTableRows(table) {
   if (!table) return [];
@@ -247,8 +261,8 @@ async function fetchPlayerProfile(slug, seasonStr) {
   const nameEl = doc.querySelector('h1 span');
   const name = nameEl ? nameEl.textContent.trim() : slug;
 
-  const perGameTable = getTable(doc, html, 'per_game');
-  const advancedTable = getTable(doc, html, 'advanced');
+  const perGameTable = getTableAny(doc, html, ['per_game_stats', 'per_game']);
+  const advancedTable = getTableAny(doc, html, ['advanced_stats', 'advanced']);
   const perGameRows = parseTableRows(perGameTable);
   const advancedRows = parseTableRows(advancedTable);
 
@@ -258,7 +272,7 @@ async function fetchPlayerProfile(slug, seasonStr) {
   try {
     const shootingHtml = await fetchViaProxy(shootingUrl);
     const shootingDoc = parseHtml(shootingHtml);
-    const shootingRows = parseTableRows(getTable(shootingDoc, shootingHtml, 'shooting'));
+    const shootingRows = parseTableRows(getTableAny(shootingDoc, shootingHtml, ['shooting_stats', 'shooting']));
     shooting = extractShooting(shootingRows, seasonStr);
   } catch (e) {
     // Shooting detail is a nice-to-have; missing it degrades to N/D axes, not a hard failure.
@@ -302,8 +316,8 @@ async function fetchLeagueDataset(seasonStr, minMinutes) {
     ]);
     const perGameDoc = parseHtml(perGameHtml);
     const advancedDoc = parseHtml(advancedHtml);
-    const perGameRows = parseTableRows(getTable(perGameDoc, perGameHtml, 'per_game_stats') || getTable(perGameDoc, perGameHtml, 'totals_stats'));
-    const advancedRows = parseTableRows(getTable(advancedDoc, advancedHtml, 'advanced_stats') || getTable(advancedDoc, advancedHtml, 'advanced'));
+    const perGameRows = parseTableRows(getTableAny(perGameDoc, perGameHtml, ['per_game_stats', 'totals_stats', 'per_game']));
+    const advancedRows = parseTableRows(getTableAny(advancedDoc, advancedHtml, ['advanced_stats', 'advanced']));
 
     // A traded player has one row per team plus a combined "TOT" row; prefer TOT.
     const bySlug = {};
@@ -361,5 +375,7 @@ if (typeof module !== 'undefined') {
   module.exports = {
     fetchPlayerProfile, fetchLeagueDataset, searchPlayers, listSeasons, seasonLabel, currentSeasonEndYear,
     ProxyError, PlayerNotFoundError
+  };
+}
   };
 }
