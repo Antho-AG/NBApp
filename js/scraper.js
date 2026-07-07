@@ -10,31 +10,33 @@
 
 const BBREF_BASE = 'https://www.basketball-reference.com';
 
-// Public CORS proxies, tried in order. Free proxies get rate-limited or blocked by
-// target sites unpredictably, so a single one (corsproxy.io) is not reliable enough
-// on its own — fall through the list until one responds successfully.
-const CORS_PROXIES = [
-  (url) => 'https://corsproxy.io/?url=' + encodeURIComponent(url),
-  (url) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-  (url) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url)
-];
-
 class ProxyError extends Error {}
 class PlayerNotFoundError extends Error {}
 
+// Requests go through our own Vercel serverless function (/api/bbref), which
+// fetches Basketball-Reference server-to-server. This avoids the browser's
+// CORS restriction entirely and removes the dependency on free public CORS
+// proxies (corsproxy.io / allorigins / codetabs), which were unreliable and
+// caused "tous les proxys CORS ont échoué" errors.
 async function fetchViaProxy(url) {
-  for (const buildProxyUrl of CORS_PROXIES) {
-    let res;
-    try {
-      res = await fetch(buildProxyUrl(url));
-    } catch (e) {
-      continue; // network error / CORS failure on this proxy, try the next one
-    }
-    if (res.status === 404) throw new PlayerNotFoundError('Joueur non trouvé sur Basketball-Reference');
-    if (!res.ok) continue; // this proxy rejected/rate-limited us, try the next one
-    return res.text();
+  let res;
+  try {
+    res = await fetch(`/api/bbref?url=${encodeURIComponent(url)}`);
+  } catch (e) {
+    throw new ProxyError('Basketball-Reference inaccessible — vérifiez votre connexion et réessayez dans quelques instants');
   }
-  throw new ProxyError('Basketball-Reference inaccessible — tous les proxys CORS ont échoué, réessayez dans quelques instants');
+  if (res.status === 404) throw new PlayerNotFoundError('Joueur non trouvé sur Basketball-Reference');
+  if (!res.ok) {
+    let detail = res.status;
+    try {
+      const body = await res.json();
+      detail = body.error || detail;
+    } catch (e) {
+      // response wasn't JSON, keep the status code
+    }
+    throw new ProxyError(`Basketball-Reference inaccessible (${detail}), réessayez dans quelques instants`);
+  }
+  return res.text();
 }
 
 function parseHtml(html) {
