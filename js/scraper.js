@@ -1,67 +1,512 @@
 /**
- * Server-side proxy for NBA.com's internal stats API (stats.nba.com/stats/leaguedashptstats),
- * used for player-tracking stats — Catch & Shoot% and Pull-Up% — that Basketball-Reference
- * does not publish at all.
+ * BBRef data collection layer.
  *
- * There is no official public API / API key for stats.nba.com; it's the same undocumented
- * endpoint nba.com/stats itself calls client-side. It rejects requests that don't look like
- * they come from a browser on nba.com, hence the header set below (Referer/Origin/
- * x-nba-stats-* headers). Note: NBA.com is known to block requests from some cloud/datacenter
- * IP ranges (including AWS, which Vercel functions run on) — if that happens here, this
- * endpoint returns a normal error response and the app degrades to "N/D" for these two axes
- * only, exactly like any other missing stat. It never breaks the rest of the app.
+ * Basketball-Reference has no official API and blocks direct cross-origin
+ * requests from a browser, so every request goes through a public CORS proxy.
+ * Some BBRef tables (advanced, shooting) are shipped wrapped inside an HTML
+ * comment when JS hasn't run server-side to "reveal" them — getTable() below
+ * unwraps those comments before parsing.
  */
 
-const ALLOWED_MEASURE_TYPES = new Set(['CatchShoot', 'PullUpShot']);
+const BBREF_BASE = 'https://www.basketball-reference.com';
 
-module.exports = async function handler(req, res) {
-  const { season, measureType, seasonType } = req.query;
+class ProxyError extends Error {}
+class PlayerNotFoundError extends Error {}
 
-  if (!season || typeof season !== 'string') {
-    res.status(400).json({ error: 'missing_season' });
-    return;
+// Requests go through our own Vercel serverless function (/api/bbref), which
+// fetches Basketball-Reference server-to-server. This avoids the browser's
+// CORS restriction entirely and removes the dependency on free public CORS
+// proxies (corsproxy.io / allorigins / codetabs), which were unreliable and
+// caused "tous les proxys CORS ont échoué" errors.
+async function fetchViaProxy(url) {
+  let res;
+  try {
+    res = await fetch(`/api/bbref?url=${encodeURIComponent(url)}`);
+  } catch (e) {
+    throw new ProxyError('Basketball-Reference inaccessible — vérifiez votre connexion et réessayez dans quelques instants');
   }
-  if (!measureType || typeof measureType !== 'string' || !ALLOWED_MEASURE_TYPES.has(measureType)) {
-    res.status(400).json({ error: 'invalid_measure_type' });
-    return;
+  if (res.status === 404) throw new PlayerNotFoundError('Joueur non trouvé sur Basketball-Reference');
+  if (!res.ok) {
+    let detail = res.status;
+    try {
+      const body = await res.json();
+      detail = body.error || detail;
+    } catch (e) {
+      // response wasn't JSON, keep the status code
+    }
+    throw new ProxyError(`Basketball-Reference inaccessible (${detail}), réessayez dans quelques instants`);
   }
+  return res.text();
+}
 
-  const params = new URLSearchParams({
-    College: '', Conference: '', Country: '', DateFrom: '', DateTo: '', Division: '',
-    DraftPick: '', DraftYear: '', GameScope: '', Height: '', ISTRound: '', LastNGames: '0',
-    LeagueID: '00', Location: '', Month: '0', OpponentTeamID: '0', Outcome: '', PORound: '0',
-    PerMode: 'PerGame', PlayerExperience: '', PlayerOrTeam: 'Player', PlayerPosition: '',
-    PtMeasureType: measureType, Season: season, SeasonSegment: '',
-    SeasonType: seasonType || 'Regular Season', StarterBench: '', TeamID: '0',
-    VsConference: '', VsDivision: '', Weight: ''
+function parseHtml(html) {
+  return new DOMParser().parseFromString(html, 'text/html');
+}
+
+/** Find a table by id, unwrapping BBRef's HTML-comment-hidden tables if needed. */
+function getTable(doc, rawHtml, tableId) {
+  let table = doc.getElementById(tableId);
+  if (table) return table;
+
+  const commentRegex = /<!--([\s\S]*?)-->/g;
+  let match;
+  while ((match = commentRegex.exec(rawHtml))) {
+    if (match[1].includes(`id="${tableId}"`)) {
+      const innerDoc = parseHtml(match[1]);
+      table = innerDoc.getElementById(tableId);
+      if (table) return table;
+    }
+  }
+  return null;
+}
+
+/**
+ * BBRef has renamed several table ids over time (e.g. "per_game" -> "per_game_stats"
+ * on player pages, while league pages already used "_stats"-suffixed ids). Try each
+ * candidate id in order and return the first table found, so the scraper survives
+ * either naming scheme.
+ */
+function getTableAny(doc, rawHtml, tableIds) {
+  for (const id of tableIds) {
+    const table = getTable(doc, rawHtml, id);
+    if (table) return table;
+  }
+  return null;
+}
+
+/** Parse a BBRef table's <tbody> rows into objects keyed by data-stat, skipping repeated header rows. */
+function parseTableRows(table) {
+  if (!table) return [];
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return [];
+  const rows = [...tbody.querySelectorAll('tr')].filter(tr => !tr.classList.contains('thead'));
+  return rows.map(tr => {
+    const obj = {};
+    tr.querySelectorAll('[data-stat]').forEach(cell => {
+      const stat = cell.getAttribute('data-stat');
+      obj[stat] = cell.textContent.trim();
+    });
+    const link = tr.querySelector('[data-stat="name_display"] a, th[data-stat="player"] a, td[data-stat="player"] a');
+    if (link) {
+      const m = link.getAttribute('href').match(/\/players\/\w\/([\w]+)\.html/);
+      if (m) obj._slug = m[1];
+    }
+    return obj;
+  });
+}
+
+function num(v) {
+  if (v == null || v === '') return null;
+  const n = parseFloat(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+/** ---- Player search / autocomplete ---- */
+async function searchPlayers(query) {
+  if (!query || query.trim().length < 2) return [];
+  const url = `${BBREF_BASE}/search/search.fcgi?search=${encodeURIComponent(query)}`;
+  const html = await fetchViaProxy(url);
+  const doc = parseHtml(html);
+
+  const results = [];
+  const seen = new Set();
+  doc.querySelectorAll('a[href*="/players/"]').forEach(a => {
+    const m = a.getAttribute('href').match(/\/players\/(\w)\/(\w+)\.html$/);
+    if (!m) return;
+    const slug = m[2];
+    if (seen.has(slug)) return;
+    const name = a.textContent.trim();
+    if (!name) return;
+    seen.add(slug);
+    results.push({ slug, name });
   });
 
-  const url = `https://stats.nba.com/stats/leaguedashptstats?${params.toString()}`;
+  // If BBRef redirected straight to a single player page (unambiguous match),
+  // build a single suggestion from the page title instead.
+  if (results.length === 0) {
+    const h1 = doc.querySelector('h1 span');
+    const m = html.match(/\/players\/\w\/(\w+)\.html/);
+    if (h1 && m) results.push({ slug: m[1], name: h1.textContent.trim() });
+  }
 
+  return results.slice(0, 8);
+}
+
+/** ---- Season helpers ---- */
+function currentSeasonEndYear(now = new Date()) {
+  const month = now.getMonth(); // 0-indexed
+  return month >= 9 ? now.getFullYear() + 1 : now.getFullYear();
+}
+function seasonLabel(endYear) {
+  const start = endYear - 1;
+  return `${start}-${String(endYear).slice(-2)}`;
+}
+function listSeasons() {
+  const latest = currentSeasonEndYear();
+  const seasons = [];
+  for (let y = latest; y >= 1980; y--) seasons.push({ endYear: y, label: seasonLabel(y) });
+  return seasons;
+}
+
+/** ---- Bio / physical parsing from a player's main page ---- */
+function parseBio(doc, html, seasonLabelStr) {
+  const meta = doc.querySelector('#meta');
+  const text = meta ? meta.textContent : html;
+
+  const bio = { heightCm: null, weightKg: null, age: null, position: null, team: null };
+
+  const hw = text.match(/\((\d{2,3})cm,\s*(\d{2,3})kg\)/);
+  if (hw) {
+    bio.heightCm = parseInt(hw[1], 10);
+    bio.weightKg = parseInt(hw[2], 10);
+  }
+
+  // Veteran/multi-position players (e.g. "Position: Small Forward, Power Forward,
+  // Point Guard, Center, and Shooting Guard") list every position they've ever played,
+  // comma-separated, before the next "▪" bullet — take the first (primary) one rather
+  // than matching a fixed set of single-word patterns, which fails on comma lists.
+  const posMatch = text.match(/Position:\s*([^▪\n]+?)\s*(?:▪|\n|$)/);
+  if (posMatch) {
+    const raw = posMatch[1].trim();
+    const firstPos = raw.split(',')[0].replace(/^and\s+/i, '').trim();
+    const abbrevMap = { 'Point Guard': 'PG', 'Shooting Guard': 'SG', 'Small Forward': 'SF', 'Power Forward': 'PF', 'Center': 'C' };
+    const matchKey = Object.keys(abbrevMap).find(k => firstPos === k || firstPos.startsWith(k));
+    bio.position = matchKey ? abbrevMap[matchKey] : firstPos.split(/[\s\-\/]/)[0].slice(0, 2).toUpperCase();
+  }
+
+  // Age as of the selected season: derive from birth date + season start year.
+  const birthMatch = html.match(/data-birth="(\d{4})-(\d{2})-(\d{2})"/);
+  if (birthMatch && seasonLabelStr) {
+    const birthYear = parseInt(birthMatch[1], 10);
+    const seasonStartYear = parseInt(seasonLabelStr.split('-')[0], 10);
+    bio.age = seasonStartYear - birthYear;
+  }
+
+  const teamLink = meta ? meta.querySelector('a[href*="/teams/"]') : null;
+  bio.team = teamLink ? teamLink.textContent.trim() : null;
+
+  // Draft Combine measurements are not published per-player on BBRef in a
+  // stable, reliably-scrapable location — never fabricated, always N/D unless found.
+  bio.wingspanCm = null;
+  bio.handLengthCm = null;
+  bio.handWidthCm = null;
+  bio.maxVerticalCm = null;
+
+  return bio;
+}
+
+// BBRef renamed several data-stat keys in its 2024/2025 redesign:
+// "season" -> "year_id", and the combined-team row for a traded player used to be
+// marked team_id="TOT", now it's team_name_abbr="2TM"/"3TM"/"4TM" (or still "TOT"
+// on some pages). rowSeason()/isCombinedRow() read both old and new keys so the
+// scraper works regardless of which version BBRef serves.
+function rowSeason(r) {
+  return r.year_id || r.season;
+}
+function isCombinedRow(r) {
+  const team = r.team_name_abbr || r.team_id || '';
+  return team === 'TOT' || /^\dTM$/.test(team);
+}
+function findSeasonRow(rows, seasonStr) {
+  const matches = rows.filter(r => rowSeason(r) === seasonStr);
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+  return matches.find(isCombinedRow) || matches[matches.length - 1];
+}
+
+function extractPerGame(rows, seasonStr) {
+  const row = findSeasonRow(rows, seasonStr);
+  if (!row) return null;
+  return {
+    PTS: num(row.pts_per_g), G: num(row.games ?? row.g), MP: num(row.mp_per_g),
+    FG_PCT: num(row.fg_pct) != null ? num(row.fg_pct) * 100 : null,
+    THREE_PCT: num(row.fg3_pct) != null ? num(row.fg3_pct) * 100 : null,
+    FT_PCT: num(row.ft_pct) != null ? num(row.ft_pct) * 100 : null,
+    AST: num(row.ast_per_g), BLK: num(row.blk_per_g), STL: num(row.stl_per_g),
+    TOV: num(row.tov_per_g), ORB: num(row.orb_per_g), DRB: num(row.drb_per_g)
+  };
+}
+
+function extractAdvanced(rows, seasonStr) {
+  const row = findSeasonRow(rows, seasonStr);
+  if (!row) return null;
+  return {
+    PER: num(row.per),
+    TS_PCT: num(row.ts_pct) != null ? num(row.ts_pct) * 100 : null,
+    USG_PCT: num(row.usg_pct),
+    BPM: num(row.bpm), DBPM: num(row.dbpm), WS_48: num(row.ws_per_48), DWS: num(row.dws),
+    BLK_PCT: num(row.blk_pct), STL_PCT: num(row.stl_pct),
+    DREB_PCT: num(row.drb_pct), OREB_PCT: num(row.orb_pct), TRB_PCT: num(row.trb_pct),
+    AST_PCT: num(row.ast_pct), TOV_PCT: num(row.tov_pct),
+    FT_RATE: num(row.fta_per_fga_pct)
+  };
+}
+
+// Normalize a player name for cross-source matching (BBRef vs NBA.com stats use
+// slightly different formatting: accents, "Jr."/"II" suffixes, punctuation).
+function normalizePlayerName(name) {
+  return (name || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[.']/g, '')
+    .replace(/\s+(jr|sr|ii|iii|iv|v)\.?$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractShooting(rows, seasonStr) {
+  const row = findSeasonRow(rows, seasonStr);
+  if (!row) return { DUNK_PCT: null, TWO_PCT: null, THREE_PCT_SHARE: null, CS_PCT: null, PU_PCT: null, AST_RATIO: null };
+  // BBRef renamed these columns too: fg_pct_ast_2p/3p -> pct_ast_fg2/fg3,
+  // pct_fga_02p/03p -> pct_fga_fg2a/fg3a. Read both so older/newer markup both work.
+  const pctAst2 = num(row.pct_ast_fg2 ?? row.fg_pct_ast_2p);
+  const pctAst3 = num(row.pct_ast_fg3 ?? row.fg_pct_ast_3p);
+  const astRatio = (pctAst2 != null || pctAst3 != null)
+    ? ((pctAst2 || 0) + (pctAst3 || 0)) / ((pctAst2 != null ? 1 : 0) + (pctAst3 != null ? 1 : 0)) * 100
+    : null;
+  const twoShare = num(row.pct_fga_fg2a ?? row.pct_fga_02p);
+  const threeShare = num(row.pct_fga_fg3a ?? row.pct_fga_03p);
+  return {
+    DUNK_PCT: num(row.pct_fga_dunk) != null ? num(row.pct_fga_dunk) * 100 : null,
+    TWO_PCT: twoShare != null ? twoShare * 100 : null,
+    THREE_PCT_SHARE: threeShare != null ? threeShare * 100 : null,
+    // NBA.com/Synergy tracking stats (Catch&Shoot%, Pull-Up%) are not published on
+    // Basketball-Reference at all — always N/D, never approximated.
+    CS_PCT: null,
+    PU_PCT: null,
+    AST_RATIO: astRatio
+  };
+}
+
+// League bulk shooting table: one row per season already (no season column to match),
+// so this reads fields directly like extractPerGameFlat/extractAdvancedFlat do.
+function extractShootingFlat(row) {
+  if (!row) return { DUNK_PCT: null, TWO_PCT: null, THREE_PCT_SHARE: null, CS_PCT: null, PU_PCT: null, AST_RATIO: null };
+  const pctAst2 = num(row.pct_ast_fg2 ?? row.fg_pct_ast_2p);
+  const pctAst3 = num(row.pct_ast_fg3 ?? row.fg_pct_ast_3p);
+  const astRatio = (pctAst2 != null || pctAst3 != null)
+    ? ((pctAst2 || 0) + (pctAst3 || 0)) / ((pctAst2 != null ? 1 : 0) + (pctAst3 != null ? 1 : 0)) * 100
+    : null;
+  const twoShare = num(row.pct_fga_fg2a ?? row.pct_fga_02p);
+  const threeShare = num(row.pct_fga_fg3a ?? row.pct_fga_03p);
+  return {
+    DUNK_PCT: num(row.pct_fga_dunk) != null ? num(row.pct_fga_dunk) * 100 : null,
+    TWO_PCT: twoShare != null ? twoShare * 100 : null,
+    THREE_PCT_SHARE: threeShare != null ? threeShare * 100 : null,
+    CS_PCT: null,
+    PU_PCT: null,
+    AST_RATIO: astRatio
+  };
+}
+
+/**
+ * Fetch league-wide Catch & Shoot% / Pull-Up% via our own /api/nba-tracking proxy
+ * (NBA.com player tracking — not published on BBRef at all). Returns a Map keyed by
+ * normalized player name -> FG% (0-100). Never throws: on any failure (including
+ * NBA.com blocking the request) it resolves to an empty map, and callers leave
+ * CS_PCT/PU_PCT as N/D, same as any other unavailable stat.
+ */
+async function fetchNbaTrackingMap(seasonStr, measureType) {
+  const cacheKey = `nba-tracking:${measureType}:${seasonStr}`;
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) return new Map(JSON.parse(cached));
+
+  const map = new Map();
   try {
-    const upstream = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.nba.com/',
-        'Origin': 'https://www.nba.com',
-        'x-nba-stats-origin': 'stats',
-        'x-nba-stats-token': 'true'
+    const res = await fetch(`/api/nba-tracking?season=${encodeURIComponent(seasonStr)}&measureType=${measureType}`);
+    if (res.ok) {
+      const json = await res.json();
+      const rs = json && json.resultSets && json.resultSets[0];
+      if (rs) {
+        const nameIdx = rs.headers.indexOf('PLAYER_NAME');
+        const pctField = measureType === 'CatchShoot' ? 'CATCH_SHOOT_FG_PCT' : 'PULL_UP_FG_PCT';
+        const pctIdx = rs.headers.indexOf(pctField);
+        rs.rowSet.forEach(row => {
+          const key = normalizePlayerName(row[nameIdx]);
+          const pct = num(row[pctIdx]);
+          if (key && pct != null) map.set(key, pct * 100);
+        });
       }
+    }
+  } catch (e) {
+    // NBA.com tracking is a nice-to-have enrichment on top of BBRef data; any failure
+    // here (network, blocked IP, unexpected shape) just leaves the map empty.
+  }
+
+  sessionStorage.setItem(cacheKey, JSON.stringify([...map]));
+  return map;
+}
+
+/** Fetch full profile for one player+season. Uses sessionStorage cache. */
+async function fetchPlayerProfile(slug, seasonStr) {
+  const cacheKey = `nba-player:${slug}:${seasonStr}`;
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const initial = slug[0];
+  const playerUrl = `${BBREF_BASE}/players/${initial}/${slug}.html`;
+
+  const html = await fetchViaProxy(playerUrl);
+  const doc = parseHtml(html);
+
+  const nameEl = doc.querySelector('h1 span');
+  const name = nameEl ? nameEl.textContent.trim() : slug;
+
+  const perGameTable = getTableAny(doc, html, ['per_game_stats', 'per_game']);
+  const advancedTable = getTableAny(doc, html, ['advanced_stats', 'advanced']);
+  const perGameRows = parseTableRows(perGameTable);
+  const advancedRows = parseTableRows(advancedTable);
+
+  const bio = parseBio(doc, html, seasonStr);
+
+  // The season-by-season shot-zone breakdown (dunk%, 2P/3P share, % assisted) lives in
+  // a "shooting" table on the player's MAIN page, not on the separate /shooting/<year>
+  // URL (that page is a game-splits breakdown — by month, quarter, etc. — for a single
+  // season and doesn't carry these columns at all).
+  let shooting = { DUNK_PCT: null, TWO_PCT: null, THREE_PCT_SHARE: null, CS_PCT: null, PU_PCT: null, AST_RATIO: null };
+  try {
+    const shootingRows = parseTableRows(getTableAny(doc, html, ['shooting_stats', 'shooting']));
+    shooting = extractShooting(shootingRows, seasonStr);
+  } catch (e) {
+    // Shooting detail is a nice-to-have; missing it degrades to N/D axes, not a hard failure.
+  }
+
+  // Catch & Shoot% / Pull-Up% aren't on Basketball-Reference at all — enrich from
+  // NBA.com's own tracking stats (best-effort, matched by normalized player name).
+  try {
+    const nameKey = normalizePlayerName(name);
+    const [csMap, puMap] = await Promise.all([
+      fetchNbaTrackingMap(seasonStr, 'CatchShoot'),
+      fetchNbaTrackingMap(seasonStr, 'PullUpShot')
+    ]);
+    if (csMap.has(nameKey)) shooting.CS_PCT = csMap.get(nameKey);
+    if (puMap.has(nameKey)) shooting.PU_PCT = puMap.get(nameKey);
+  } catch (e) {
+    // Leave CS_PCT/PU_PCT as N/D.
+  }
+
+  const perGame = extractPerGame(perGameRows, seasonStr);
+  const advanced = extractAdvanced(advancedRows, seasonStr);
+
+  if (!perGame && !advanced) {
+    throw new PlayerNotFoundError(`Aucune statistique pour ${name} en saison ${seasonStr}`);
+  }
+
+  const seasonRow = findSeasonRow(perGameRows, seasonStr) || findSeasonRow(advancedRows, seasonStr);
+
+  const profile = {
+    slug, name, season: seasonStr,
+    team: seasonRow ? seasonRow.team_name_abbr || seasonRow.team_id : bio.team,
+    position: (seasonRow && seasonRow.pos) || bio.position,
+    age: bio.age,
+    heightCm: bio.heightCm, weightKg: bio.weightKg,
+    wingspanCm: bio.wingspanCm, handLengthCm: bio.handLengthCm, handWidthCm: bio.handWidthCm, maxVerticalCm: bio.maxVerticalCm,
+    perGame: perGame || {}, advanced: advanced || {}, shooting
+  };
+
+  sessionStorage.setItem(cacheKey, JSON.stringify(profile));
+  return profile;
+}
+
+/** ---- League-wide reference population for percentile computation ---- */
+async function fetchLeagueDataset(seasonStr, minMinutes) {
+  const endYear = parseInt(seasonStr.split('-')[0], 10) + 1;
+  const cacheKey = `nba-league-raw:${seasonStr}`;
+  let raw = null;
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) {
+    raw = JSON.parse(cached);
+  } else {
+    const [perGameHtml, advancedHtml, shootingHtml] = await Promise.all([
+      fetchViaProxy(`${BBREF_BASE}/leagues/NBA_${endYear}_per_game.html`),
+      fetchViaProxy(`${BBREF_BASE}/leagues/NBA_${endYear}_advanced.html`),
+      fetchViaProxy(`${BBREF_BASE}/leagues/NBA_${endYear}_shooting.html`)
+    ]);
+    const perGameDoc = parseHtml(perGameHtml);
+    const advancedDoc = parseHtml(advancedHtml);
+    const shootingDoc = parseHtml(shootingHtml);
+    const perGameRows = parseTableRows(getTableAny(perGameDoc, perGameHtml, ['per_game_stats', 'totals_stats', 'per_game']));
+    const advancedRows = parseTableRows(getTableAny(advancedDoc, advancedHtml, ['advanced_stats', 'advanced']));
+    const shootingRows = parseTableRows(getTableAny(shootingDoc, shootingHtml, ['shooting_stats', 'shooting']));
+
+    // A traded player has one row per team plus a combined row (team_name_abbr
+    // "2TM"/"3TM", formerly "TOT"); prefer that combined row over single-team splits.
+    const bySlug = {};
+    perGameRows.forEach(r => {
+      if (!r._slug) return;
+      const existing = bySlug[r._slug];
+      if (!existing || isCombinedRow(r)) bySlug[r._slug] = { ...existing, pg: r };
+    });
+    advancedRows.forEach(r => {
+      if (!r._slug) return;
+      const existing = bySlug[r._slug] || {};
+      if (!existing.adv || isCombinedRow(r)) bySlug[r._slug] = { ...existing, adv: r };
+    });
+    shootingRows.forEach(r => {
+      if (!r._slug) return;
+      const existing = bySlug[r._slug] || {};
+      if (!existing.sh || isCombinedRow(r)) bySlug[r._slug] = { ...existing, sh: r };
     });
 
-    if (!upstream.ok) {
-      res.status(upstream.status).json({ error: 'upstream_error', status: upstream.status });
-      return;
-    }
+    // Catch & Shoot% / Pull-Up% aren't on BBRef — enrich the whole reference population
+    // from NBA.com's tracking stats too, so these axes get a real percentile instead of
+    // comparing against an empty distribution. Best-effort: an empty map here (e.g. if
+    // NBA.com blocks the request) just leaves CS_PCT/PU_PCT null for every row, same as
+    // any other unavailable stat — it doesn't break anything else.
+    const [csMap, puMap] = await Promise.all([
+      fetchNbaTrackingMap(seasonStr, 'CatchShoot'),
+      fetchNbaTrackingMap(seasonStr, 'PullUpShot')
+    ]);
 
-    const json = await upstream.json();
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    // League-wide tracking numbers move at most once a day; cache for 6h at the edge.
-    res.setHeader('Cache-Control', 's-maxage=21600, stale-while-revalidate=86400');
-    res.status(200).json(json);
-  } catch (e) {
-    res.status(502).json({ error: 'fetch_failed', message: String(e && e.message || e) });
+    raw = Object.entries(bySlug)
+      .filter(([, v]) => v.pg && v.adv)
+      .map(([slug, v]) => {
+        const shooting = extractShootingFlat(v.sh);
+        const nameKey = normalizePlayerName(v.pg.name_display || v.pg.player);
+        if (csMap.has(nameKey)) shooting.CS_PCT = csMap.get(nameKey);
+        if (puMap.has(nameKey)) shooting.PU_PCT = puMap.get(nameKey);
+        return {
+          slug, position: v.pg.pos || v.adv.pos, name: v.pg.name_display || v.pg.player,
+          perGame: extractPerGameFlat(v.pg),
+          advanced: extractAdvancedFlat(v.adv),
+          shooting
+        };
+      });
+
+    sessionStorage.setItem(cacheKey, JSON.stringify(raw));
   }
-};
+
+  return raw.filter(r => r.perGame && r.perGame.MP != null && r.perGame.MP >= minMinutes);
+}
+
+// League bulk tables don't carry a `season` column per row (one row = one season already),
+// so these flat extractors read fields directly instead of matching a season string.
+function extractPerGameFlat(row) {
+  return {
+    PTS: num(row.pts_per_g), G: num(row.games ?? row.g), MP: num(row.mp_per_g),
+    FG_PCT: num(row.fg_pct) != null ? num(row.fg_pct) * 100 : null,
+    THREE_PCT: num(row.fg3_pct) != null ? num(row.fg3_pct) * 100 : null,
+    FT_PCT: num(row.ft_pct) != null ? num(row.ft_pct) * 100 : null,
+    AST: num(row.ast_per_g), BLK: num(row.blk_per_g), STL: num(row.stl_per_g),
+    TOV: num(row.tov_per_g), ORB: num(row.orb_per_g), DRB: num(row.drb_per_g)
+  };
+}
+function extractAdvancedFlat(row) {
+  return {
+    PER: num(row.per),
+    TS_PCT: num(row.ts_pct) != null ? num(row.ts_pct) * 100 : null,
+    USG_PCT: num(row.usg_pct),
+    BPM: num(row.bpm), DBPM: num(row.dbpm), WS_48: num(row.ws_per_48), DWS: num(row.dws),
+    BLK_PCT: num(row.blk_pct), STL_PCT: num(row.stl_pct),
+    DREB_PCT: num(row.drb_pct), OREB_PCT: num(row.orb_pct), TRB_PCT: num(row.trb_pct),
+    AST_PCT: num(row.ast_pct), TOV_PCT: num(row.tov_pct),
+    FT_RATE: num(row.fta_per_fga_pct)
+  };
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    fetchPlayerProfile, fetchLeagueDataset, searchPlayers, listSeasons, seasonLabel, currentSeasonEndYear,
+    ProxyError, PlayerNotFoundError
+  };
+}
